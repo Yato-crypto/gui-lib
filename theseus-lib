@@ -14,7 +14,7 @@
 
 local CombatDomain = {}
 CombatDomain.__index = CombatDomain
-CombatDomain.Version = "1.1.0"
+CombatDomain.Version = "1.2.0"
 CombatDomain.Flags = {}
 CombatDomain.Windows = {}
 CombatDomain._defaultWindow = nil
@@ -23,6 +23,7 @@ local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
+local ContentProvider = game:GetService("ContentProvider")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
@@ -141,10 +142,11 @@ local DEFAULT_CONFIG = {
     MAX_PING_MARKERS     = 8,
     MAX_PROXIMITY_SHOWN  = 4,
     SITREP_BG_ENABLED    = true,
-    SITREP_BG_FRAMES_DIR = "CombatCommand/sitrep_frames",
+    SITREP_BG_FRAMES_DIR = "ForestCompanion/sitrep_frames",
     SITREP_BG_FRAMES_COUNT = 240,
     SITREP_BG_FRAMES_FPS = 10,
     SITREP_BG_FRAMES_EXT = "jpg",
+    SITREP_BG_FRAMES_PREFIX = "frame_",
     SITREP_BG_FRAMES_PAD = 4,
     SITREP_STREAM_MAX_FPS = 10,
     SITREP_RESIDENT_FRAME_LIMIT = 96,
@@ -287,8 +289,58 @@ local function cloneTable(src)
     return out
 end
 
+local BOOTSTRAP_KEY_MAP = {
+    domainAnimatedBg = "DOMAIN_GLOBAL_BG_ENABLED",
+    domainHideDecor = "DOMAIN_GLOBAL_BG_HIDE_DECOR",
+    sitrepFramesEnabled = "SITREP_BG_ENABLED",
+    sitrepFramesDir = "SITREP_BG_FRAMES_DIR",
+    sitrepFramesCount = "SITREP_BG_FRAMES_COUNT",
+    sitrepFramesFps = "SITREP_BG_FRAMES_FPS",
+    sitrepFramesExt = "SITREP_BG_FRAMES_EXT",
+    sitrepFramesExtension = "SITREP_BG_FRAMES_EXT",
+    sitrepFramesPrefix = "SITREP_BG_FRAMES_PREFIX",
+    sitrepFramesPad = "SITREP_BG_FRAMES_PAD",
+    sitrepStreamMaxFps = "SITREP_STREAM_MAX_FPS",
+    sitrepResidentFrameLimit = "SITREP_RESIDENT_FRAME_LIMIT",
+    sitrepResidentWarmupSec = "SITREP_RESIDENT_WARMUP_SEC",
+    sitrepBgProceduralFallback = "SITREP_BG_PROCEDURAL_FALLBACK",
+    sitrepVideoEnabled = "SITREP_BG_VIDEO_ENABLED",
+    sitrepVideoPath = "SITREP_BG_VIDEO_PATH",
+    reduceMotion = "REDUCED_MOTION",
+}
+
+local function readBootstrapOverrides()
+    local overrides = {}
+    local env = nil
+    pcall(function()
+        if getgenv then env = getgenv() end
+    end)
+    env = env or _G
+    local sources = {}
+    if type(env) == "table" then
+        table.insert(sources, env.COMBAT_COMMAND_CFG)
+        table.insert(sources, env.FOREST_COMPANION_CFG)
+        table.insert(sources, env.THESEUS_CFG)
+    end
+    for _, source in ipairs(sources) do
+        if type(source) == "table" then
+            for fromKey, toKey in pairs(BOOTSTRAP_KEY_MAP) do
+                if source[fromKey] ~= nil then
+                    overrides[toKey] = source[fromKey]
+                end
+            end
+            if tostring(source.sitrepStreamMode or ""):lower() == "frames" then
+                overrides.SITREP_BG_ENABLED = true
+                overrides.SITREP_BG_VIDEO_ENABLED = false
+            end
+        end
+    end
+    return overrides
+end
+
 local function newConfig(overrides)
     local config = cloneTable(DEFAULT_CONFIG)
+    mergeInto(config, readBootstrapOverrides())
     mergeInto(config, overrides or {})
     return config
 end
@@ -362,6 +414,97 @@ local function safeDisconnect(conn)
         if conn then conn:Disconnect() end
     end)
 end
+
+local function basename(path)
+    path = tostring(path or "")
+    return path:match("([^/\\]+)$") or path
+end
+
+local function joinPath(dir, file)
+    dir = tostring(dir or "")
+    file = tostring(file or "")
+    if dir == "" then return file end
+    if dir:sub(-1) == "/" or dir:sub(-1) == "\\" then
+        return dir .. file
+    end
+    return dir .. "/" .. file
+end
+
+local function fileExists(path)
+    local ok, result = pcall(function()
+        return isfile and isfile(path)
+    end)
+    return ok and result == true
+end
+
+local function resolveLocalAsset(path)
+    if not path or path == "" then return nil end
+    local candidates = { tostring(path) }
+    local base = basename(path)
+    if base ~= path then
+        table.insert(candidates, base)
+    else
+        table.insert(candidates, joinPath("ForestCompanion", base))
+        table.insert(candidates, joinPath("CombatCommand", base))
+    end
+    for _, candidate in ipairs(candidates) do
+        local canTry = true
+        if isfile then
+            canTry = fileExists(candidate)
+        end
+        if canTry then
+            local ok, asset = pcall(function()
+                if getcustomasset then
+                    return getcustomasset(candidate)
+                end
+                return candidate
+            end)
+            if ok and asset and asset ~= "" then
+                return asset, candidate
+            end
+        end
+    end
+    return nil
+end
+
+local function sampledIndices(indices, limit)
+    local n = #indices
+    limit = math.clamp(tonumber(limit) or n, 1, math.max(1, n))
+    if n <= limit then
+        local out = {}
+        for i = 1, n do out[i] = indices[i] end
+        return out
+    end
+    local out, used = {}, {}
+    if limit == 1 then return { indices[1] } end
+    for slot = 1, limit do
+        local pos = math.floor(1 + ((slot - 1) * (n - 1) / (limit - 1)) + 0.5)
+        pos = math.clamp(pos, 1, n)
+        while used[pos] and pos < n do pos += 1 end
+        while used[pos] and pos > 1 do pos -= 1 end
+        if not used[pos] then
+            used[pos] = true
+            table.insert(out, indices[pos])
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function preloadInChunks(instances, chunkSize)
+    chunkSize = math.clamp(tonumber(chunkSize) or 16, 1, 64)
+    for i = 1, #instances, chunkSize do
+        local chunk = {}
+        for j = i, math.min(#instances, i + chunkSize - 1) do
+            table.insert(chunk, instances[j])
+        end
+        pcall(function()
+            ContentProvider:PreloadAsync(chunk)
+        end)
+        task.wait()
+    end
+end
+
 
 local Maid = {}
 Maid.__index = Maid
@@ -868,6 +1011,105 @@ function Window:_buildToastLayer(parent)
     self.ToastLayer = layer
 end
 
+
+function Window:_resolveBackgroundOptions(raw)
+    local config = self.Config
+    local options = {}
+    if raw == false then
+        options.Type = "None"
+        return options
+    end
+    if type(raw) == "table" then
+        mergeInto(options, raw)
+    elseif raw == true or raw == nil then
+        options.Mode = "frames"
+    elseif type(raw) == "string" then
+        options.Mode = raw
+    end
+
+    local enabled = options.Enabled
+    if enabled == nil then enabled = options.enabled end
+    if enabled == false then
+        options.Type = "None"
+        return options
+    end
+
+    local mode = options.Mode or options.mode or options.Type or options.type
+    if mode == nil then
+        mode = config.SITREP_BG_ENABLED and "frames" or "procedural"
+    end
+    mode = tostring(mode):lower()
+
+    if mode == "none" or mode == "off" or mode == "false" then
+        options.Type = "None"
+    elseif mode == "frame" or mode == "frames" or mode == "resident" or mode == "residentbank" then
+        options.Type = "Frames"
+        options.Directory = options.Directory or options.Dir or options.Folder or options.folder or config.SITREP_BG_FRAMES_DIR
+        options.Count = options.Count or options.count or config.SITREP_BG_FRAMES_COUNT
+        options.Extension = options.Extension or options.Ext or options.extension or config.SITREP_BG_FRAMES_EXT
+        options.Prefix = options.Prefix or options.prefix or config.SITREP_BG_FRAMES_PREFIX or "frame_"
+        options.Pad = options.Pad or options.Digits or options.digits or config.SITREP_BG_FRAMES_PAD
+        options.FPS = options.FPS or options.Fps or options.fps or config.SITREP_BG_FRAMES_FPS
+        options.StreamMaxFPS = options.StreamMaxFPS or options.StreamMaxFps or options.streamMaxFps or config.SITREP_STREAM_MAX_FPS
+        options.ResidentLimit = options.ResidentLimit or options.residentLimit or config.SITREP_RESIDENT_FRAME_LIMIT
+        options.WarmupSeconds = options.WarmupSeconds or options.warmupSeconds or config.SITREP_RESIDENT_WARMUP_SEC
+        options.ProceduralFallback = options.ProceduralFallback
+        if options.ProceduralFallback == nil then options.ProceduralFallback = options.proceduralFallback end
+        if options.ProceduralFallback == nil then options.ProceduralFallback = config.SITREP_BG_PROCEDURAL_FALLBACK end
+    elseif mode == "image" or mode == "static" then
+        options.Type = "Image"
+    else
+        options.Type = "ProceduralRain"
+    end
+
+    local dimValue = options.dim or options.Dim
+    if options.ShadeTransparency == nil and dimValue ~= nil then
+        local dim = math.clamp(tonumber(dimValue) or 0.32, 0, 1)
+        options.ShadeTransparency = 1 - dim
+    end
+    if options.Scanline == false or options.scanline == false then
+        options.ScanlineEnabled = false
+    end
+    return options
+end
+
+function Window:_backdropName(name)
+    name = tostring(name or "")
+    return name:find("Backdrop") or name:find("CyberRain") or name:find("CyberStarfield") or name:find("CyberSweep") or name:find("CyberDust") or name:find("SitrepVideo") or name:find("SitrepFrame") or name:find("SitrepResident") or name:find("BackdropShade") or name:find("BackdropTint") or name:find("BackdropScan")
+end
+
+function Window:_bumpContentAboveBackdrop(parent)
+    local minZ = tonumber(self.Config.SITREP_CONTENT_MIN_Z) or 10
+    if not parent then return end
+    for _, inst in ipairs(parent:GetDescendants()) do
+        if inst:IsA("GuiObject") and not self:_backdropName(inst.Name) then
+            if inst.ZIndex < minZ then
+                inst.ZIndex = minZ
+            end
+        end
+    end
+end
+
+function Window:_applyCinematicBackdrop(options)
+    options = options or {}
+    local config = self.Config
+    if config.DOMAIN_GLOBAL_BG_HIDE_DECOR ~= false and options.HideDecor ~= false then
+        if self.GridLayer then self.GridLayer.Visible = false end
+        if self.Wash then self.Wash.Visible = false end
+        if self.Emblem then self.Emblem.Visible = false end
+    end
+    for _, frame in pairs(self.TabFrames or {}) do
+        if frame and frame.Parent then
+            local target = tonumber(options.PanelTransparency or config.DOMAIN_TAB_FRAME_TRANSPARENCY) or 0.42
+            frame.BackgroundTransparency = target
+            frame:SetAttribute("AnimBaseAlpha", target)
+        end
+    end
+    task.defer(function()
+        if self.Root then self:_bumpContentAboveBackdrop(self.Root) end
+    end)
+end
+
 function Window:_buildDomain()
     local config = self.Config
     local gui = Instance.new("ScreenGui")
@@ -895,10 +1137,12 @@ function Window:_buildDomain()
     self:_buildToastLayer(root)
     self:_bindDomainScale()
     self:_bindHotkeys()
-    if self.Options.Background then
+    if self.Options.AnimatedBackground ~= nil then
+        self:SetBackground(self.Options.AnimatedBackground)
+    elseif self.Options.Background then
         self:SetBackground(self.Options.Background)
     elseif config.DOMAIN_GLOBAL_BG_ENABLED then
-        self:SetBackground({Type = "ProceduralRain", Intensity = 0.22})
+        self:SetBackground(true)
     end
 end
 
@@ -1329,6 +1573,11 @@ function Window:Destroy()
     for _, tab in ipairs(self.Tabs) do
         if tab.Maid then tab.Maid:Clean() end
     end
+    if self.BackgroundMaid then self.BackgroundMaid:Clean() end
+    if self.BackgroundLayer then
+        pcall(function() self.BackgroundLayer:Destroy() end)
+        self.BackgroundLayer = nil
+    end
     self.Maid:Clean()
     if self.Gui then
         pcall(function() self.Gui:Destroy() end)
@@ -1395,7 +1644,7 @@ CombatDomain.Notify = function(self, options)
 end
 
 function Window:SetBackground(options)
-    options = options or {}
+    options = self:_resolveBackgroundOptions(options)
     if self.BackgroundMaid then self.BackgroundMaid:Clean() end
     self.BackgroundMaid = Maid.new()
     if self.BackgroundLayer then
@@ -1404,7 +1653,7 @@ function Window:SetBackground(options)
     end
     local config = self.Config
     local bg = Instance.new("Frame")
-    bg.Name = "DomainAnimatedBackdrop"
+    bg.Name = "SitrepVideoBackdropHolder"
     bg.Position = UDim2.new(0, 0, 0, 0)
     bg.Size = UDim2.new(1, 0, 1, 0)
     bg.BackgroundTransparency = 1
@@ -1414,11 +1663,13 @@ function Window:SetBackground(options)
     self.BackgroundLayer = bg
 
     local bgType = tostring(options.Type or options.Mode or "ProceduralRain")
-    if bgType == "None" or bgType == "Off" then
+    local bgTypeLower = bgType:lower()
+    if bgTypeLower == "none" or bgTypeLower == "off" then
         bg.Visible = false
         return bg
     end
-    if bgType == "Image" then
+
+    if bgTypeLower == "image" or bgTypeLower == "static" then
         local image = Instance.new("ImageLabel")
         image.Name = "BackdropImage"
         image.Size = UDim2.new(1, 0, 1, 0)
@@ -1426,50 +1677,65 @@ function Window:SetBackground(options)
         image.Image = normalizeIcon(options.Image or options.ImageId or options.Asset)
         image.ImageTransparency = tonumber(options.ImageTransparency) or 0.25
         image.ScaleType = options.ScaleType or Enum.ScaleType.Crop
-        image.ZIndex = 0
+        image.ZIndex = 1
         image.Parent = bg
-    elseif bgType == "Frames" then
+    elseif bgTypeLower == "frames" or bgTypeLower == "frame" or bgTypeLower == "resident" or bgTypeLower == "residentbank" then
         self:_mountFrameBackdrop(bg, options)
     else
         self:_mountProceduralBackdrop(bg, options)
     end
 
     local shade = Instance.new("Frame")
-    shade.Name = "BackdropShade"
+    shade.Name = "SitrepFrameReadabilityShade"
     shade.Size = UDim2.new(1, 0, 1, 0)
     shade.BackgroundColor3 = config.DOMAIN_BG
     shade.BackgroundTransparency = tonumber(options.ShadeTransparency) or config.DOMAIN_BG_SHADE_TRANSPARENCY
     shade.BorderSizePixel = 0
-    shade.ZIndex = 0
+    shade.ZIndex = 8
     shade.Parent = bg
+    local shadeGrad = Instance.new("UIGradient")
+    shadeGrad.Rotation = 90
+    shadeGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.08),
+        NumberSequenceKeypoint.new(0.52, 0.36),
+        NumberSequenceKeypoint.new(1, 0.04),
+    })
+    shadeGrad.Parent = shade
 
     local tint = Instance.new("Frame")
-    tint.Name = "BackdropTint"
+    tint.Name = "SitrepFrameBlueTint"
     tint.Size = UDim2.new(1, 0, 1, 0)
     tint.BackgroundColor3 = config.ACCENT
     tint.BackgroundTransparency = tonumber(options.TintTransparency) or config.DOMAIN_BG_TINT_TRANSPARENCY
     tint.BorderSizePixel = 0
-    tint.ZIndex = 0
+    tint.ZIndex = 9
     tint.Parent = bg
 
-    local scanlines = Instance.new("Frame")
-    scanlines.Name = "BackdropScanlines"
-    scanlines.Size = UDim2.new(1, 0, 1, 0)
-    scanlines.BackgroundTransparency = 1
-    scanlines.BorderSizePixel = 0
-    scanlines.ZIndex = 0
-    scanlines.Parent = bg
-    for i = 1, 36 do
-        local line = Instance.new("Frame")
-        line.Name = "ScanLine"
-        line.Position = UDim2.new(0, 0, i / 36, 0)
-        line.Size = UDim2.new(1, 0, 0, 1)
-        line.BackgroundColor3 = config.ACCENT
-        line.BackgroundTransparency = tonumber(options.ScanlineTransparency) or config.DOMAIN_BG_SCANLINE_ALPHA
-        line.BorderSizePixel = 0
-        line.ZIndex = 0
-        line.Parent = scanlines
+    if options.ScanlineEnabled ~= false then
+        local scan = Instance.new("Frame")
+        scan.Name = "SitrepFrameScanline"
+        scan.Position = UDim2.new(0, 0, -0.04, 0)
+        scan.Size = UDim2.new(1, 0, 0, tonumber(options.ScanlineHeight) or 2)
+        scan.BackgroundColor3 = config.ACCENT
+        scan.BackgroundTransparency = tonumber(options.ScanlineTransparency) or config.DOMAIN_BG_SCANLINE_ALPHA
+        scan.BorderSizePixel = 0
+        scan.ZIndex = 10
+        scan.Parent = bg
+        addGradient(scan, config, NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.5, 0.16),
+            NumberSequenceKeypoint.new(1, 1),
+        }))
+        local startClock = os.clock()
+        self.BackgroundMaid:Give(RunService.RenderStepped:Connect(function()
+            if not scan or not scan.Parent then return end
+            local period = tonumber(options.ScanlinePeriod) or 3.2
+            local y = ((os.clock() - startClock) / period) % 1.08
+            scan.Position = UDim2.new(0, 0, y - 0.04, 0)
+        end))
     end
+
+    self:_applyCinematicBackdrop(options)
     return bg
 end
 
@@ -1581,10 +1847,10 @@ function Window:_mountProceduralBackdrop(parent, options)
         }
     end
 
-    local t = 0
+    local elapsed = 0
     self.BackgroundMaid:Give(RunService.RenderStepped:Connect(function(dt)
-        if not parent or not parent.Parent then return end
-        t += dt
+        if not parent or not parent.Parent or parent.Visible == false then return end
+        elapsed += dt
 
         for _, data in ipairs(streaks) do
             local frame = data.Frame
@@ -1598,7 +1864,7 @@ function Window:_mountProceduralBackdrop(parent, options)
                 if data.X > 1.08 then data.X = -0.08 end
                 if data.X < -0.10 then data.X = 1.08 end
                 frame.Position = UDim2.new(data.X, 0, data.Y, 0)
-                frame.BackgroundTransparency = math.clamp(data.BaseAlpha + math.sin((t * data.Pulse) + data.Offset) * 0.055, 0.48, 0.96)
+                frame.BackgroundTransparency = math.clamp(data.BaseAlpha + math.sin((elapsed * data.Pulse) + data.Offset) * 0.055, 0.48, 0.96)
             end
         end
 
@@ -1612,50 +1878,159 @@ function Window:_mountProceduralBackdrop(parent, options)
                 if data.X > 1.04 then data.X = -0.04 end
                 if data.X < -0.05 then data.X = 1.04 end
                 frame.Position = UDim2.new(data.X, 0, data.Y, 0)
-                frame.BackgroundTransparency = math.clamp(data.BaseAlpha + math.sin((t * data.Pulse) + data.Offset) * 0.075, 0.58, 0.98)
+                frame.BackgroundTransparency = math.clamp(data.BaseAlpha + math.sin((elapsed * data.Pulse) + data.Offset) * 0.075, 0.58, 0.98)
             end
         end
 
         if sweep and sweep.Parent then
-            local y = ((t * 0.040 * speed) % 1.26) - 0.18
+            local y = ((elapsed * 0.040 * speed) % 1.26) - 0.18
             sweep.Position = UDim2.new(0, 0, y, 0)
-            sweep.BackgroundTransparency = math.clamp((tonumber(options.SweepTransparency) or 0.935) + math.sin(t * 1.7) * 0.018, 0.88, 0.98)
+            sweep.BackgroundTransparency = math.clamp((tonumber(options.SweepTransparency) or 0.935) + math.sin(elapsed * 1.7) * 0.018, 0.88, 0.98)
         end
     end))
+    return parent
 end
+
 function Window:_mountFrameBackdrop(parent, options)
-    local fps = tonumber(options.FPS or options.Fps or self.Config.SITREP_BG_FRAMES_FPS) or 10
-    local count = tonumber(options.Count or self.Config.SITREP_BG_FRAMES_COUNT) or 1
-    local dir = tostring(options.Directory or options.Dir or self.Config.SITREP_BG_FRAMES_DIR)
-    local ext = tostring(options.Extension or options.Ext or self.Config.SITREP_BG_FRAMES_EXT or "jpg")
-    local pad = tonumber(options.Pad or self.Config.SITREP_BG_FRAMES_PAD) or 4
-    local images = {}
-    for i = 1, count do
-        local file = string.format("%s/%0" .. tostring(pad) .. "d.%s", dir, i, ext)
-        local asset = file
-        pcall(function()
-            if getcustomasset then asset = getcustomasset(file) end
-        end)
-        table.insert(images, asset)
+    local config = self.Config
+    local base = Instance.new("Frame")
+    base.Name = "SitrepFrameBase"
+    base.Size = UDim2.new(1, 0, 1, 0)
+    base.BackgroundColor3 = Color3.fromRGB(8, 14, 28)
+    base.BorderSizePixel = 0
+    base.ZIndex = 0
+    base.Parent = parent
+
+    local fallback = nil
+    if options.ProceduralFallback ~= false then
+        fallback = Instance.new("Frame")
+        fallback.Name = "CyberRainProcedural"
+        fallback.Size = UDim2.new(1, 0, 1, 0)
+        fallback.BackgroundTransparency = 1
+        fallback.BorderSizePixel = 0
+        fallback.ZIndex = 0
+        fallback.Parent = parent
+        self:_mountProceduralBackdrop(fallback, {
+            Count = tonumber(options.FallbackCount) or math.floor((config.DOMAIN_BG_PROCEDURAL_COUNT or 78) * 0.65),
+            Particles = tonumber(options.FallbackParticles) or math.floor((config.DOMAIN_BG_PROCEDURAL_PARTICLES or 34) * 0.65),
+            Speed = tonumber(options.FallbackSpeed) or (config.DOMAIN_BG_PROCEDURAL_SPEED or 1.15),
+            Intensity = tonumber(options.FallbackIntensity) or 0.24,
+            Alpha = tonumber(options.FallbackAlpha) or 0.78,
+            SweepEnabled = options.SweepEnabled,
+        })
     end
-    local img = Instance.new("ImageLabel")
-    img.Name = "ResidentFrame"
-    img.Size = UDim2.new(1, 0, 1, 0)
-    img.BackgroundTransparency = 1
-    img.ImageTransparency = tonumber(options.ImageTransparency) or 0.08
-    img.ScaleType = options.ScaleType or Enum.ScaleType.Crop
-    img.ZIndex = 0
-    img.Parent = parent
-    local idx = 1
-    local accum = 0
-    self.BackgroundMaid:Give(RunService.RenderStepped:Connect(function(dt)
-        accum += dt
-        if accum < (1 / math.max(1, fps)) then return end
-        accum = 0
-        idx += 1
-        if idx > #images then idx = 1 end
-        img.Image = images[idx]
-    end))
+
+    local host = Instance.new("Frame")
+    host.Name = "SitrepFramePlayerHost"
+    host.Size = UDim2.new(1, 0, 1, 0)
+    host.BackgroundTransparency = 1
+    host.BorderSizePixel = 0
+    host.ClipsDescendants = true
+    host.ZIndex = 1
+    host.Parent = parent
+
+    local alive = true
+    self.BackgroundMaid:Give(function()
+        alive = false
+    end)
+
+    task.spawn(function()
+        local dir = tostring(options.Directory or options.Dir or config.SITREP_BG_FRAMES_DIR or "ForestCompanion/sitrep_frames")
+        local count = tonumber(options.Count or config.SITREP_BG_FRAMES_COUNT) or 240
+        local ext = tostring(options.Extension or options.Ext or config.SITREP_BG_FRAMES_EXT or "jpg")
+        local pad = tonumber(options.Pad or config.SITREP_BG_FRAMES_PAD) or 4
+        local prefix = tostring(options.Prefix or config.SITREP_BG_FRAMES_PREFIX or "frame_")
+        local frameAssets, frameIndices = {}, {}
+
+        for i = 1, count do
+            local fileName = string.format("%s%0" .. tostring(pad) .. "d.%s", prefix, i, ext)
+            local asset = resolveLocalAsset(joinPath(dir, fileName))
+            if not asset and pad ~= 3 then
+                local fallbackName = string.format("%s%03d.%s", prefix, i, ext)
+                asset = resolveLocalAsset(joinPath(dir, fallbackName))
+            end
+            if asset then
+                frameAssets[i] = asset
+                table.insert(frameIndices, i)
+            end
+        end
+
+        if not alive or not host or not host.Parent then return end
+        if #frameIndices == 0 then
+            return
+        end
+
+        local residentLimit = math.clamp(tonumber(options.ResidentLimit or config.SITREP_RESIDENT_FRAME_LIMIT) or 96, 1, count)
+        local picked = sampledIndices(frameIndices, residentLimit)
+        local labels = {}
+        local zBack = 1
+        local zTop = 2
+
+        for slot, index in ipairs(picked) do
+            if not alive or not host or not host.Parent then return end
+            local label = Instance.new("ImageLabel")
+            label.Name = string.format("SitrepResident_%03d", slot)
+            label.AnchorPoint = Vector2.new(0.5, 0.5)
+            label.Position = UDim2.new(0.5, 0, 0.5, 0)
+            label.Size = UDim2.new(1.12, 0, 1.12, 0)
+            label.BackgroundTransparency = 1
+            label.BorderSizePixel = 0
+            label.Image = frameAssets[index]
+            label.ImageTransparency = (slot == 1) and (tonumber(options.ImageTransparency) or 0) or 1
+            label.ScaleType = options.ScaleType or Enum.ScaleType.Crop
+            label.ZIndex = (slot == 1) and zTop or zBack
+            label.Parent = host
+            labels[slot] = label
+            if slot % 12 == 0 then task.wait() end
+        end
+
+        if not alive or not host or not host.Parent or #labels == 0 then return end
+        preloadInChunks(labels, tonumber(options.PreloadChunkSize) or 16)
+        if not alive or not host or not host.Parent then return end
+
+        local warmup = tonumber(options.WarmupSeconds or config.SITREP_RESIDENT_WARMUP_SEC) or 4
+        if warmup > 0 then task.wait(warmup) end
+        if not alive or not host or not host.Parent then return end
+
+        if fallback and fallback.Parent then
+            fallback.Visible = false
+        end
+
+        if config.REDUCED_MOTION or options.ReducedMotion == true or #labels == 1 then
+            labels[1].ImageTransparency = tonumber(options.ImageTransparency) or 0
+            labels[1].ZIndex = zTop
+            return
+        end
+
+        local fps = tonumber(options.FPS or options.Fps or config.SITREP_BG_FRAMES_FPS) or 10
+        local cap = tonumber(options.StreamMaxFPS or options.StreamMaxFps or config.SITREP_STREAM_MAX_FPS) or fps
+        fps = math.clamp(math.min(fps, cap), 1, 30)
+        local interval = 1 / fps
+        local cursor = 1
+        local nextAt = os.clock() + interval
+        self.BackgroundMaid:Give(RunService.RenderStepped:Connect(function()
+            if not alive or not host or not host.Parent then return end
+            local now = os.clock()
+            if now < nextAt then return end
+            repeat
+                nextAt += interval
+            until nextAt > now
+
+            local prev = labels[cursor]
+            cursor = (cursor % #labels) + 1
+            local current = labels[cursor]
+            if prev and prev.Parent then
+                prev.ZIndex = zBack
+                prev.ImageTransparency = 1
+            end
+            if current and current.Parent then
+                current.ZIndex = zTop
+                current.ImageTransparency = tonumber(options.ImageTransparency) or 0
+            end
+        end))
+    end)
+
+    return host
 end
 
 function Window:CreateBackground(options)
