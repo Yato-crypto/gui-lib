@@ -1,10 +1,9 @@
 
--- Theseus / CombatCyberGuiLib v2.1
--- Reusable cyber glass GUI library
--- Raw GitHub loadstring target. Keep this file as the library only; no demo code.
+-- Theseus / CombatCyberGuiLib v3.0
+-- Reusable cyber glass GUI library with responsive domain shell
 
 local CombatCyberGuiLib = {}
-CombatCyberGuiLib.VERSION = "2.1.0"
+CombatCyberGuiLib.VERSION = "3.0.0-domain-polish"
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -14,6 +13,7 @@ local ContextActionService = game:GetService("ContextActionService")
 local HttpService = game:GetService("HttpService")
 local ContentProvider = game:GetService("ContentProvider")
 local GuiService = game:GetService("GuiService")
+local Workspace = game:GetService("Workspace")
 
 local LP = Players.LocalPlayer
 
@@ -282,8 +282,7 @@ end
 local BackgroundManager = {}
 BackgroundManager.__index = BackgroundManager
 
-CombatCyberGuiLib.Backgrounds = CombatCyberGuiLib.Backgrounds or {}
-CombatCyberGuiLib.Backgrounds.Presets = CombatCyberGuiLib.Backgrounds.Presets or {}
+CombatCyberGuiLib.Backgrounds = {Presets = {}}
 
 function CombatCyberGuiLib.Backgrounds.Register(name, spec)
     if type(name) == "string" and type(spec) == "table" then
@@ -726,6 +725,133 @@ function Window:_makePanel(parent, opt)
     return panel
 end
 
+
+function Window:_viewportSize()
+    local cam = Workspace.CurrentCamera
+    if cam and cam.ViewportSize then
+        return cam.ViewportSize
+    end
+    return Vector2.new(1280, 720)
+end
+
+function Window:_desiredPixelSize()
+    local raw = self.config.size
+    local w = tonumber(self.config.width) or 1260
+    local h = tonumber(self.config.height) or 760
+    if typeof(raw) == "UDim2" then
+        local vp = self:_viewportSize()
+        w = raw.X.Offset + (raw.X.Scale * vp.X)
+        h = raw.Y.Offset + (raw.Y.Scale * vp.Y)
+    elseif type(raw) == "table" then
+        w = tonumber(raw.width or raw.w) or w
+        h = tonumber(raw.height or raw.h) or h
+    end
+    return w, h
+end
+
+function Window:_computeDomainSize()
+    local vp = self:_viewportSize()
+    local marginX = tonumber(self.config.marginX) or 36
+    local marginY = tonumber(self.config.marginY) or 36
+    local minW = tonumber(self.config.minWidth) or 760
+    local minH = tonumber(self.config.minHeight) or 480
+    local maxW = math.max(minW, vp.X - marginX)
+    local maxH = math.max(minH, vp.Y - marginY)
+    local w, h = self:_desiredPixelSize()
+    w = math.floor(clamp(w, math.min(minW, maxW), maxW))
+    h = math.floor(clamp(h, math.min(minH, maxH), maxH))
+    return UDim2.fromOffset(w, h), w, h
+end
+
+function Window:_applyResponsiveLayout()
+    if not self.root then return end
+    local size, w, h = self:_computeDomainSize()
+    self.root.Size = size
+    self.root.AnchorPoint = Vector2.new(0.5, 0.5)
+    self.root.Position = UDim2.fromScale(0.5, 0.5)
+    if self.hintLabel then
+        self.hintLabel.Visible = w > 940
+    end
+    if self.tabStrip then
+        local tabH = w < 900 and 38 or 42
+        self.tabStrip.Position = UDim2.fromOffset(18, w < 900 and 70 or 72)
+        self.tabStrip.Size = UDim2.new(1, -36, 0, tabH)
+    end
+    if self.body then
+        local topY = w < 900 and 118 or 124
+        self.body.Position = UDim2.fromOffset(18, topY)
+        self.body.Size = UDim2.new(1, -36, 1, -(topY + 54))
+    end
+    if self.footer then
+        self.footer.Position = UDim2.new(0, 18, 1, -46)
+        self.footer.Size = UDim2.new(1, -36, 0, 32)
+    end
+end
+
+function Window:_bindResponsiveLayout()
+    local function hookCamera(cam)
+        if cam and cam.GetPropertyChangedSignal then
+            self.cleaner:Connect(cam:GetPropertyChangedSignal("ViewportSize"), function()
+                self:_applyResponsiveLayout()
+            end)
+        end
+    end
+    hookCamera(Workspace.CurrentCamera)
+    self.cleaner:Connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+        hookCamera(Workspace.CurrentCamera)
+        self:_applyResponsiveLayout()
+    end)
+end
+
+function Window:_makeTogglePill()
+    local label = self.config.toggleLabel or "THESEUS"
+    local keyName = "RS"
+    pcall(function()
+        local key = self.keyConfig.toggleKey or self.config.toggleKey or Enum.KeyCode.RightShift
+        keyName = key.Name
+    end)
+    local pill = self:_makeButton(self.shellGui, label .. "  [" .. keyName .. "]", function()
+        self:Toggle()
+    end, {
+        size = UDim2.fromOffset(178, 36),
+        pos = self.config.togglePosition or UDim2.new(1, -196, 1, -52),
+        textSize = 12,
+        font = self.theme.FONT_BOLD,
+        transparency = 0.05,
+        radius = 10,
+        z = 120,
+        strokeColor = self.theme.ACCENT,
+        strokeTransparency = 0.20,
+    })
+    pill.Name = "DomainToggle"
+    self.togglePill = pill
+    return pill
+end
+
+function Window:_bindDrag()
+    if self.config.draggable == false then return end
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    self.cleaner:Connect(self.top.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = self.root.Position
+        end
+    end)
+    self.cleaner:Connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    self.cleaner:Connect(UserInputService.InputChanged, function(input)
+        if not dragging or input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local delta = input.Position - dragStart
+        self.root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end)
+end
+
 function Window:_makeButton(parent, text, callback, opt)
     opt = opt or {}
     local btn = new("TextButton", {
@@ -805,11 +931,11 @@ function Window:_createGuis()
     self.shellGui = new("ScreenGui", {
         Name = (self.config.id or "CombatCyber") .. "_Shell",
         ResetOnSpawn = false,
-        IgnoreGuiInset = false,
+        IgnoreGuiInset = true,
         DisplayOrder = order + 1,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     })
-    pcall(function() self.shellGui.ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets end)
+    pcall(function() self.shellGui.ScreenInsets = Enum.ScreenInsets.None end)
     parentGui(self.bgGui, self.player)
     parentGui(self.shellGui, self.player)
     self.cleaner:Give(self.bgGui)
@@ -828,7 +954,7 @@ function Window:_buildShell()
         Name = "Domain",
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.fromScale(0.5, 0.5),
-        Size = self.config.size or UDim2.new(0, 1480, 0, 860),
+        Size = self:_computeDomainSize(),
         BackgroundColor3 = self.theme.BG,
         BackgroundTransparency = scaleTransparency(0.08),
         BorderSizePixel = 0,
@@ -856,6 +982,11 @@ function Window:_buildShell()
 
     self.toastHolder = new("Frame", {Name = "Toasts", BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -24, 0, 124), Size = UDim2.new(0, 320, 1, -160), ZIndex = 80}, self.shellGui)
     Style.list(self.toastHolder, Enum.FillDirection.Vertical, 8, Enum.HorizontalAlignment.Right)
+
+    self:_makeTogglePill()
+    self:_applyResponsiveLayout()
+    self:_bindResponsiveLayout()
+    self:_bindDrag()
 end
 
 function Window:_bindInput()
@@ -883,6 +1014,9 @@ function Window:_applyOpenState(skipTween)
     self.root.Visible = self.open
     self.bgGui.Enabled = self.open or (self.config.backgroundAlwaysVisible == true)
     self.shellGui.Enabled = true
+    if self.togglePill then
+        self.togglePill.Text = (self.open and "HIDE DOMAIN" or "OPEN DOMAIN") .. "  [" .. ((self.keyConfig.toggleKey or self.config.toggleKey or Enum.KeyCode.RightShift).Name) .. "]"
+    end
     if skipTween or reducedMotion() then
         self.root.BackgroundTransparency = scaleTransparency(0.08)
         return
@@ -907,14 +1041,21 @@ function Window:Tab(name, icon, options)
     self.tabs[name] = tab
     self.tabOrder[#self.tabOrder + 1] = name
     self:_addTabButton(tab)
-    if not self.activeTab then self:SelectTab(name) end
+    if not self.activeTab then
+        self.activeTab = name
+        task.defer(function()
+            if not self.destroyed and self.activeTab == name then
+                self:SelectTab(name)
+            end
+        end)
+    end
     return tab
 end
 
 function Window:_addTabButton(tab)
     local btn = self:_makeButton(self.tabStrip, (tab.icon and (tab.icon .. "  ") or "") .. tab.name, function()
         self:SelectTab(tab.name)
-    end, {size = UDim2.new(0, tab.options.width or 145, 1, 0), textSize = 12, font = self.theme.FONT_BODY, transparency = 0.24, z = 35})
+    end, {size = UDim2.new(0, tab.options.width or 132, 1, 0), textSize = 12, font = self.theme.FONT_BODY, transparency = 0.24, z = 35})
     tab.button = btn
 end
 
@@ -1361,11 +1502,10 @@ CombatCyberGuiLib.Backgrounds.Register("frames_default", {
     dim = 0.34,
 })
 
-
-local __theseusEnv = (getgenv and getgenv()) or _G
-if __theseusEnv then
-    __theseusEnv.TheseusGuiLib = CombatCyberGuiLib
-    __theseusEnv.CombatCyberGuiLib = CombatCyberGuiLib
-end
+pcall(function()
+    local env = (getgenv and getgenv()) or _G
+    env.TheseusGuiLib = CombatCyberGuiLib
+    env.CombatCyberGuiLib = CombatCyberGuiLib
+end)
 
 return CombatCyberGuiLib
