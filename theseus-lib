@@ -14,7 +14,7 @@
 
 local CombatDomain = {}
 CombatDomain.__index = CombatDomain
-CombatDomain.Version = "1.0.0"
+CombatDomain.Version = "1.1.0"
 CombatDomain.Flags = {}
 CombatDomain.Windows = {}
 CombatDomain._defaultWindow = nil
@@ -22,6 +22,7 @@ CombatDomain._defaultWindow = nil
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
@@ -54,6 +55,10 @@ local DEFAULT_CONFIG = {
     TAB_PREV_KEY         = Enum.KeyCode.Left,
     TAB_NEXT_KEY         = Enum.KeyCode.Right,
     GUI_IGNORE_PROCESSED = true,
+    GUI_IGNORE_PROCESSED_FOR_HOTKEYS = true,
+    HOTKEY_USE_CONTEXT_ACTION = true,
+    HOTKEY_CONTEXT_PRIORITY = 999999,
+    HOTKEY_BLOCK_WHILE_TYPING = true,
     RING_HOLD_THRESHOLD  = 0.3,
     LENS_MAX_MEMORY      = 80,
     LENS_MAX_RESULTS     = 7,
@@ -156,9 +161,14 @@ local DEFAULT_CONFIG = {
     DOMAIN_GLOBAL_BG_HIDE_DECOR = true,
     DOMAIN_TAB_FRAME_TRANSPARENCY = 0.42,
     DOMAIN_TAB_FRAME_STROKE = 0.84,
-    DOMAIN_BG_SHADE_TRANSPARENCY = 0.68,
-    DOMAIN_BG_TINT_TRANSPARENCY = 0.985,
-    DOMAIN_BG_SCANLINE_ALPHA = 0.98,
+    DOMAIN_BG_SHADE_TRANSPARENCY = 0.76,
+    DOMAIN_BG_TINT_TRANSPARENCY = 0.975,
+    DOMAIN_BG_SCANLINE_ALPHA = 0.965,
+    DOMAIN_BG_PROCEDURAL_COUNT = 78,
+    DOMAIN_BG_PROCEDURAL_PARTICLES = 34,
+    DOMAIN_BG_PROCEDURAL_SPEED = 1.15,
+    DOMAIN_BG_PROCEDURAL_ALPHA = 0.74,
+    DOMAIN_BG_SWEEP_ENABLED = true,
     SITREP_SCENIC_MODE = true,
     SITREP_SCENIC_HIDE_MAP = true,
     SITREP_SCENIC_STATROW_FLOAT = true,
@@ -309,6 +319,19 @@ local function resolveKey(value, fallback)
         if ok and key then return key end
     end
     return fallback
+end
+
+local function keyName(key)
+    if typeofSafe(key) == "EnumItem" then return key.Name end
+    if key ~= nil then return tostring(key) end
+    return "None"
+end
+
+local function isTextBoxFocused()
+    local ok, box = pcall(function()
+        return UserInputService:GetFocusedTextBox()
+    end)
+    return ok and box ~= nil
 end
 
 local function normalizeIcon(icon)
@@ -762,7 +785,7 @@ function Window:_buildHeader(parent)
         TextColor3 = config.TEXT_SECONDARY,
         TextXAlignment = Enum.TextXAlignment.Right,
         TextTruncate = Enum.TextTruncate.AtEnd,
-        Text = tostring(self.Options.CommandHint or "RightShift close - Left/Right tabs"),
+        Text = tostring(self.Options.CommandHint or "Toggle close - Left/Right tabs"),
         ZIndex = 9,
     })
 
@@ -920,19 +943,68 @@ function Window:_bindHotkeys()
     self.ToggleAltKeybind = altKeybind
     self.NextTabKey = nextKey
     self.PrevTabKey = prevKey
+
+    local function typingBlocked()
+        return config.HOTKEY_BLOCK_WHILE_TYPING ~= false and isTextBoxFocused()
+    end
+
+    local useContextAction = self.Options.UseContextActionHotkey ~= false and config.HOTKEY_USE_CONTEXT_ACTION ~= false
+    if useContextAction then
+        local actionName = "CombatDomainToggle_" .. tostring(HttpService:GenerateGUID(false))
+        self.ContextActionName = actionName
+        local priority = tonumber(self.Options.HotkeyPriority or config.HOTKEY_CONTEXT_PRIORITY) or 999999
+        local ok = pcall(function()
+            ContextActionService:BindActionAtPriority(actionName, function(_, inputState, inputObject)
+                if inputState ~= Enum.UserInputState.Begin then
+                    return Enum.ContextActionResult.Sink
+                end
+                if self.Destroyed then
+                    return Enum.ContextActionResult.Sink
+                end
+                if typingBlocked() then
+                    return Enum.ContextActionResult.Pass
+                end
+                if inputObject and inputObject.UserInputType == Enum.UserInputType.Keyboard then
+                    self:Toggle()
+                    return Enum.ContextActionResult.Sink
+                end
+                return Enum.ContextActionResult.Pass
+            end, false, priority, keybind, altKeybind)
+        end)
+        self.ContextHotkeyBound = ok
+        if ok then
+            self:_track(function()
+                pcall(function()
+                    ContextActionService:UnbindAction(actionName)
+                end)
+            end)
+        end
+    end
+
     self:_track(UserInputService.InputBegan:Connect(function(input, processed)
-        if processed and config.GUI_IGNORE_PROCESSED then return end
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-        if input.KeyCode == keybind or input.KeyCode == altKeybind then
-            self:Toggle()
-        elseif input.KeyCode == nextKey and self.Visible then
+        if typingBlocked() then return end
+
+        local code = input.KeyCode
+        local isToggleKey = code == keybind or code == altKeybind
+        local isNavKey = self.Visible and (code == nextKey or code == prevKey)
+        local allowProcessedHotkey = config.GUI_IGNORE_PROCESSED_FOR_HOTKEYS ~= false
+
+        if processed and config.GUI_IGNORE_PROCESSED and not (allowProcessedHotkey and (isToggleKey or isNavKey)) then
+            return
+        end
+
+        if isToggleKey then
+            if not self.ContextHotkeyBound then
+                self:Toggle()
+            end
+        elseif code == nextKey and self.Visible then
             self:NextTab()
-        elseif input.KeyCode == prevKey and self.Visible then
+        elseif code == prevKey and self.Visible then
             self:PreviousTab()
         end
     end))
 end
-
 function Window:_createTabButton(text, order, iconId, key)
     local config = self.Config
     local b = Instance.new("TextButton")
@@ -1195,7 +1267,7 @@ function Window:SelectTab(key, instant)
         end
     end
     if self.CommandHint then
-        self.CommandHint.Text = target.Name .. " - " .. tostring(self.Options.CommandHint or "RightShift close - Left/Right tabs")
+        self.CommandHint.Text = target.Name .. " - " .. tostring(self.Options.CommandHint or "Toggle close - Left/Right tabs")
     end
     self:_scrollTabIntoView(key, instant)
     self:_moveTabIndicator(key, instant)
@@ -1403,29 +1475,154 @@ end
 
 function Window:_mountProceduralBackdrop(parent, options)
     local config = self.Config
-    local count = tonumber(options.Count) or 42
-    local speed = tonumber(options.Speed) or 1
-    local alpha = tonumber(options.Alpha) or 0.88
+    local count = tonumber(options.Count or options.Streaks or config.DOMAIN_BG_PROCEDURAL_COUNT) or 78
+    local particles = tonumber(options.Particles or config.DOMAIN_BG_PROCEDURAL_PARTICLES) or math.floor(count * 0.44)
+    local speed = tonumber(options.Speed or config.DOMAIN_BG_PROCEDURAL_SPEED) or 1.15
+    local intensity = tonumber(options.Intensity) or 0.28
+    local alpha = tonumber(options.Alpha or options.Transparency or config.DOMAIN_BG_PROCEDURAL_ALPHA) or 0.74
+    alpha = math.clamp(alpha - (intensity * 0.10), 0.50, 0.94)
+
+    local streaks = {}
+    local motes = {}
+    local rng = Random.new(tonumber(options.Seed) or math.floor(os.clock() * 100000) % 1000000)
+
+    local starfield = Instance.new("Frame")
+    starfield.Name = "CyberStarfield"
+    starfield.Size = UDim2.new(1, 0, 1, 0)
+    starfield.BackgroundTransparency = 1
+    starfield.BorderSizePixel = 0
+    starfield.ZIndex = 0
+    starfield.Parent = parent
+
+    local rainLayer = Instance.new("Frame")
+    rainLayer.Name = "CyberRainLayer"
+    rainLayer.Size = UDim2.new(1, 0, 1, 0)
+    rainLayer.BackgroundTransparency = 1
+    rainLayer.BorderSizePixel = 0
+    rainLayer.ZIndex = 0
+    rainLayer.Parent = parent
+
+    local sweep = nil
+    if options.SweepEnabled ~= false and config.DOMAIN_BG_SWEEP_ENABLED ~= false then
+        sweep = Instance.new("Frame")
+        sweep.Name = "CyberSweepBand"
+        sweep.Position = UDim2.new(0, 0, -0.15, 0)
+        sweep.Size = UDim2.new(1, 0, 0, tonumber(options.SweepHeight) or 92)
+        sweep.BackgroundColor3 = config.ACCENT
+        sweep.BackgroundTransparency = tonumber(options.SweepTransparency) or 0.935
+        sweep.BorderSizePixel = 0
+        sweep.ZIndex = 0
+        sweep.Parent = parent
+        local g = addGradient(sweep, config, NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.5, 0.72),
+            NumberSequenceKeypoint.new(1, 1),
+        }))
+        g.Rotation = 90
+    end
+
+    for i = 1, particles do
+        local mote = Instance.new("Frame")
+        mote.Name = "CyberDust"
+        local size = rng:NextInteger(1, 3)
+        mote.Position = UDim2.new(rng:NextNumber(), 0, rng:NextNumber(), 0)
+        mote.Size = UDim2.new(0, size, 0, size)
+        mote.BackgroundColor3 = (i % 5 == 0) and config.ACCENT_ALT or ((i % 3 == 0) and config.ACCENT_SOFT or config.ACCENT)
+        mote.BackgroundTransparency = math.clamp(alpha + rng:NextNumber(0.05, 0.18), 0.68, 0.96)
+        mote.BorderSizePixel = 0
+        mote.ZIndex = 0
+        mote.Parent = starfield
+        addCorner(mote, size)
+        motes[i] = {
+            Frame = mote,
+            X = mote.Position.X.Scale,
+            Y = mote.Position.Y.Scale,
+            Drift = rng:NextNumber(-0.010, 0.018),
+            Rise = rng:NextNumber(-0.006, 0.020),
+            Pulse = rng:NextNumber(1.1, 2.9),
+            Offset = rng:NextNumber(0, math.pi * 2),
+            BaseAlpha = mote.BackgroundTransparency,
+        }
+    end
+
     for i = 1, count do
         local streak = Instance.new("Frame")
         streak.Name = "CyberRainStreak"
-        streak.Position = UDim2.new((i * 0.067) % 1, 0, math.random(), 0)
-        streak.Size = UDim2.new(0, math.random(1, 2), 0, math.random(18, 64))
-        streak.BackgroundColor3 = (i % 3 == 0) and config.ACCENT_ALT or config.ACCENT
-        streak.BackgroundTransparency = alpha
+        local width = rng:NextInteger(1, 3)
+        local height = rng:NextInteger(22, 112)
+        local x = rng:NextNumber(-0.08, 1.06)
+        local y = rng:NextNumber(-0.16, 1.04)
+        streak.Position = UDim2.new(x, 0, y, 0)
+        streak.Size = UDim2.new(0, width, 0, height)
+        streak.BackgroundColor3 = (i % 7 == 0) and config.ACCENT_ALT or ((i % 4 == 0) and config.ACCENT_SOFT or config.ACCENT)
+        streak.BackgroundTransparency = math.clamp(alpha + rng:NextNumber(-0.08, 0.12), 0.54, 0.94)
         streak.BorderSizePixel = 0
         streak.ZIndex = 0
-        streak.Parent = parent
+        streak.Parent = rainLayer
         addCorner(streak, 2)
-        self.BackgroundMaid:Give(RunService.RenderStepped:Connect(function(dt)
-            if not streak or not streak.Parent then return end
-            local y = streak.Position.Y.Scale + (dt * (0.018 + (i % 6) * 0.004) * speed)
-            if y > 1.05 then y = -0.08 end
-            streak.Position = UDim2.new(streak.Position.X.Scale, 0, y, 0)
-        end))
+        local grad = Instance.new("UIGradient")
+        grad.Rotation = tonumber(options.Angle) or 14
+        grad.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.20, 0.18),
+            NumberSequenceKeypoint.new(0.84, 0.40),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        grad.Parent = streak
+        streaks[i] = {
+            Frame = streak,
+            X = x,
+            Y = y,
+            Speed = rng:NextNumber(0.020, 0.070) * speed,
+            Drift = rng:NextNumber(-0.010, 0.018) * speed,
+            Pulse = rng:NextNumber(1.4, 3.8),
+            Offset = rng:NextNumber(0, math.pi * 2),
+            BaseAlpha = streak.BackgroundTransparency,
+        }
     end
-end
 
+    local t = 0
+    self.BackgroundMaid:Give(RunService.RenderStepped:Connect(function(dt)
+        if not parent or not parent.Parent then return end
+        t += dt
+
+        for _, data in ipairs(streaks) do
+            local frame = data.Frame
+            if frame and frame.Parent then
+                data.Y += data.Speed * dt * 60
+                data.X += data.Drift * dt * 60
+                if data.Y > 1.14 then
+                    data.Y = -0.18
+                    data.X = rng:NextNumber(-0.08, 1.06)
+                end
+                if data.X > 1.08 then data.X = -0.08 end
+                if data.X < -0.10 then data.X = 1.08 end
+                frame.Position = UDim2.new(data.X, 0, data.Y, 0)
+                frame.BackgroundTransparency = math.clamp(data.BaseAlpha + math.sin((t * data.Pulse) + data.Offset) * 0.055, 0.48, 0.96)
+            end
+        end
+
+        for _, data in ipairs(motes) do
+            local frame = data.Frame
+            if frame and frame.Parent then
+                data.X += data.Drift * dt * 60
+                data.Y += data.Rise * dt * 60
+                if data.Y > 1.05 then data.Y = -0.04 end
+                if data.Y < -0.06 then data.Y = 1.04 end
+                if data.X > 1.04 then data.X = -0.04 end
+                if data.X < -0.05 then data.X = 1.04 end
+                frame.Position = UDim2.new(data.X, 0, data.Y, 0)
+                frame.BackgroundTransparency = math.clamp(data.BaseAlpha + math.sin((t * data.Pulse) + data.Offset) * 0.075, 0.58, 0.98)
+            end
+        end
+
+        if sweep and sweep.Parent then
+            local y = ((t * 0.040 * speed) % 1.26) - 0.18
+            sweep.Position = UDim2.new(0, 0, y, 0)
+            sweep.BackgroundTransparency = math.clamp((tonumber(options.SweepTransparency) or 0.935) + math.sin(t * 1.7) * 0.018, 0.88, 0.98)
+        end
+    end))
+end
 function Window:_mountFrameBackdrop(parent, options)
     local fps = tonumber(options.FPS or options.Fps or self.Config.SITREP_BG_FRAMES_FPS) or 10
     local count = tonumber(options.Count or self.Config.SITREP_BG_FRAMES_COUNT) or 1
